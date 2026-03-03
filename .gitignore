@@ -1,0 +1,17 @@
+# Build artifacts
+dns-tun-lb
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go build caches
+*.test
+*.out
+
+# IDE / editor
+.DS_Store
+.vscode/
+.idea/
+

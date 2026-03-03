@@ -1,0 +1,19 @@
+# Ignore Git metadata
+.git
+.gitignore
+
+# IDE / editor files
+.vscode
+.idea
+*.swp
+
+# Build artifacts
+dns-tun-lb
+dist/
+
+# Node / vendor caches (not used now, but safe to ignore)
+node_modules
+vendor
+
+# Misc
+*.log

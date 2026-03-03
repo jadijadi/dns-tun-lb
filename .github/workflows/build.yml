@@ -1,0 +1,105 @@
+name: Build binaries and multi-arch image
+
+on:
+  workflow_dispatch: {}
+  release:
+    types: [published]
+
+jobs:
+  build-binaries:
+    name: Build Linux binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # required to upload release assets
+
+    strategy:
+      matrix:
+        goarch: [amd64, arm64]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+
+      - name: Build binary
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p dist
+          go build -o dist/dns-tun-lb-linux-${GOARCH} .
+
+      - name: Create checksum
+        run: |
+          sha256sum dist/dns-tun-lb-linux-${{ matrix.goarch }} > dist/dns-tun-lb-linux-${{ matrix.goarch }}.sha256
+
+      - name: Upload binaries to release
+        if: github.event_name == 'release'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ github.event.release.tag_name }} \
+            dist/dns-tun-lb-linux-${{ matrix.goarch }} \
+            dist/dns-tun-lb-linux-${{ matrix.goarch }}.sha256
+
+  build-and-push-image:
+    name: Build and push multi-arch Docker image
+    runs-on: ubuntu-latest
+    needs: build-binaries
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for release
+        if: github.event_name == 'release'
+        id: meta-release
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/dns-tun-lb
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest
+
+      - name: Extract metadata (tags, labels) for manual trigger
+        if: github.event_name == 'workflow_dispatch'
+        id: meta-manual
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/dns-tun-lb
+          tags: |
+            type=raw,value=${{ github.ref_name }}-{{sha}}
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ github.event_name == 'release' && steps.meta-release.outputs.tags || steps.meta-manual.outputs.tags }}
+          labels: ${{ github.event_name == 'release' && steps.meta-release.outputs.labels || steps.meta-manual.outputs.labels }}
+
