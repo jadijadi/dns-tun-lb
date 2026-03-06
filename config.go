@@ -2,6 +2,8 @@ package main
 
 import (
 	"os"
+	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -19,8 +21,10 @@ type DefaultDNSBehavior struct {
 }
 
 type GlobalConfig struct {
-	ListenAddress      string              `yaml:"listen_address"`
-	DefaultDNSBehavior DefaultDNSBehavior  `yaml:"default_dns_behavior"`
+	ListenAddress      string             `yaml:"listen_address"`
+	MetricsListen      string             `yaml:"metrics_listen"` // e.g. ":2112"; empty = metrics disabled
+	ReadTimeout        string             `yaml:"read_timeout"`   // e.g. "10s", "30s"; empty = 10s
+	DefaultDNSBehavior DefaultDNSBehavior `yaml:"default_dns_behavior"`
 }
 
 type BackendConfig struct {
@@ -38,8 +42,13 @@ type DnsttProtocolConfig struct {
 	Pools []PoolConfig `yaml:"pools"`
 }
 
+type SlipstreamProtocolConfig struct {
+	Pools []PoolConfig `yaml:"pools"`
+}
+
 type ProtocolsConfig struct {
-	Dnstt DnsttProtocolConfig `yaml:"dnstt"`
+	Dnstt      DnsttProtocolConfig      `yaml:"dnstt"`
+	Slipstream SlipstreamProtocolConfig `yaml:"slipstream"`
 }
 
 type LoggingConfig struct {
@@ -50,6 +59,8 @@ type Config struct {
 	Global    GlobalConfig    `yaml:"global"`
 	Protocols ProtocolsConfig `yaml:"protocols"`
 	Logging   LoggingConfig   `yaml:"logging"`
+
+	parsedReadTimeout time.Duration // from global.read_timeout; default 10s
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -60,6 +71,16 @@ func LoadConfig(path string) (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, err
+	}
+	cfg.Global.MetricsListen = strings.TrimSpace(cfg.Global.MetricsListen)
+	// read_timeout: default 10s if empty or invalid
+	if cfg.Global.ReadTimeout != "" {
+		if d, err := time.ParseDuration(cfg.Global.ReadTimeout); err == nil && d > 0 {
+			cfg.parsedReadTimeout = d
+		}
+	}
+	if cfg.parsedReadTimeout == 0 {
+		cfg.parsedReadTimeout = 10 * time.Second
 	}
 	return &cfg, nil
 }

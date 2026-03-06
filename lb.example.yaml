@@ -1,5 +1,7 @@
 global:
   listen_address: "0.0.0.0:5353"
+  metrics_listen: ":2112"       # Prometheus /metrics; empty = disabled
+  read_timeout: "10s"           # timeout for forward/backend UDP read; default 10s if omitted
 
   default_dns_behavior:
     mode: "forward"          # "forward" | "drop"
@@ -21,6 +23,16 @@ protocols:
             address: "10.0.0.14:5300"
           - id: "dnstt-5"
             address: "10.0.0.15:5300"
+
+  slipstream:
+    pools:
+      - name: "slipstream-main"
+        domain_suffix: "s.example.com"
+        backends:
+          - id: "slipstream-1"
+            address: "10.0.0.21:5300"
+          - id: "slipstream-2"
+            address: "10.0.0.22:5300"
 
 logging:
   level: "info"              # "error" | "info" | "debug"

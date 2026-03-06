@@ -17,7 +17,7 @@ type hashRing struct {
 	nodes []hashRingNode
 }
 
-// newHashRing builds a consistent hash ring with the given backends and replicas.
+// newHashRing builds a consistent hash ring. replicas <= 0 defaults to 64.
 func newHashRing(backends []BackendConfig, replicas int) *hashRing {
 	if len(backends) == 0 {
 		return &hashRing{}
@@ -47,7 +47,7 @@ func newHashRing(backends []BackendConfig, replicas int) *hashRing {
 	return &hashRing{nodes: nodes}
 }
 
-// choose selects a backend from the ring for the given key components.
+// choose returns the backend for the given protocol, domain suffix, and session ID (consistent hash).
 func (r *hashRing) choose(protocol, domainSuffix string, sessionID []byte) BackendConfig {
 	if len(r.nodes) == 0 {
 		return BackendConfig{}
