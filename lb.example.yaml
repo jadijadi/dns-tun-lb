@@ -1,5 +1,7 @@
 global:
   listen_address: "0.0.0.0:5353"
+  metrics_listen: ":2112"       # Prometheus /metrics; empty = disabled
+  read_timeout: "10s"           # timeout for forward/backend UDP read; default 10s if omitted
 
   default_dns_behavior:
     mode: "forward"          # "forward" | "drop"

@@ -78,6 +78,8 @@ Configuration is provided as a YAML file (passed with `-config`, default
 ```yaml
 global:
   listen_address: "0.0.0.0:53"
+  metrics_listen: ":2112"      # Prometheus /metrics; empty = disabled
+  read_timeout: "10s"           # max wait for UDP response (forward + backend); default 10s
 
   default_dns_behavior:
     mode: "forward"          # "forward" | "drop"
@@ -104,6 +106,10 @@ logging:
   level: "info"              # "error" | "info" | "debug"
 ```
 
+**Command-line flags**
+
+- **`-config`** (default `lb.yaml`): path to the YAML config file. All other settings (listen address, metrics, timeouts, etc.) are taken from the config.
+
 For the same pool, a minimal **authoritative DNS configuration** for a cluster
 of 5 load balancers might look like this:
 
@@ -126,18 +132,26 @@ t.example.com.      IN  NS    tns5.example.com.
 - **`global.listen_address`**: UDP address the LB listens on. In production
   you typically run on an unprivileged port and DNAT external UDP/53 to this
   address.
+- **`global.metrics_listen`**: Address for the Prometheus HTTP server (e.g. `":2112"`). Metrics are exposed at `http://<addr>/metrics`. If empty or omitted, the metrics server is not started.
+- **`global.read_timeout`**: Maximum time to wait for a UDP response when
+  forwarding to the resolver or to a tunnel backend. Go duration string
+  (e.g. `"10s"`, `"30s"`, `"1m"`). Default is `10s` if omitted or invalid.
+  Prevents goroutines from blocking indefinitely on unresponsive peers.
 - **`default_dns_behavior`**:
   - `mode: "forward"`: forward non-tunnel DNS to `forward_resolver` and
     relay responses.
   - `mode: "drop"`: silently drop non-tunnel DNS.
-  - If `mode: "forward"` is set, `forward_resolver` is required; otherwise
-    the LB will fail to start.
+  - If `mode: "forward"` is set, `forward_resolver` is required (e.g.
+    `"9.9.9.9:53"` or `"resolver.example.com:53"`; host may be IP or domain);
+    otherwise the LB will fail to start.
 - **`protocols.dnstt.pools[]`**:
   - `domain_suffix`: QNAME suffix that identifies a dnstt tunnel zone
     (for example `t.example.com`). The LB will match queries whose names
     are subdomains of this suffix.
   - `backends[]`: UDP endpoints of `dnstt-server` instances that terminate
-    tunnels for this suffix.
+    tunnels for this suffix. Each backend has `id` (label for metrics) and
+    `address` in `host:port` form; `host` may be an IP or a domain name
+    (resolved at dial time).
 - **`logging.level`**:
   - `"error"`: only errors.
   - `"info"`: high-level lifecycle and summary (default).
@@ -168,6 +182,41 @@ For each incoming DNS query:
 
 Packets not classified as dnstt are handled according to
 `default_dns_behavior`.
+
+---
+
+### Metrics
+
+When `global.metrics_listen` is set in the config (e.g. `":2112"`), the LB
+serves Prometheus metrics at `http://<addr>/metrics`.
+
+**Frontend (incoming traffic)**
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `dns_lb_requests_total` | counter | `protocol` | Total requests by protocol (e.g. `dnstt`, `other`). |
+| `dns_lb_routed_requests_total` | counter | `protocol`, `pool` | Requests routed to tunnel backends. |
+| `dns_lb_forwarded_requests_total` | counter | — | Requests forwarded to upstream resolver. |
+| `dns_lb_dropped_requests_total` | counter | `reason` | Dropped requests (e.g. `no_forwarder`, `forward_read_error`). |
+| `dns_lb_frontend_packets_in_total` | counter | — | UDP packets received on the frontend. |
+| `dns_lb_frontend_packets_out_total` | counter | — | UDP packets sent to clients. |
+| `dns_lb_frontend_bytes_in_total` | counter | — | Bytes received on the frontend. |
+| `dns_lb_frontend_bytes_out_total` | counter | — | Bytes sent to clients. |
+| `dns_lb_parse_errors_total` | counter | `stage` | Parse/classification errors (e.g. `dns_unpack`, `dnstt_session_id`). |
+| `dns_lb_unsupported_queries_total` | counter | `qtype` | Queries under tunnel domains with unsupported QTYPE. |
+
+**Backend (per pool/backend)**
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `dns_lb_backend_requests_total` | counter | `protocol`, `pool`, `domain`, `backend_id` | Requests routed to each backend. |
+| `dns_lb_backend_packets_sent_total` | counter | same | Packets sent to backend. |
+| `dns_lb_backend_packets_received_total` | counter | same | Packets received from backend. |
+| `dns_lb_backend_bytes_sent_total` | counter | same | Bytes sent to backend. |
+| `dns_lb_backend_bytes_received_total` | counter | same | Bytes received from backend. |
+| `dns_lb_backend_errors_total` | counter | same + `stage` | Errors by stage: `resolve`, `dial`, `write`, `read`. |
+| `dns_lb_backend_sessions_total` | counter | same | Distinct sessions observed per backend. |
+| `dns_lb_backend_sessions_active` | gauge | same | Approximate active sessions (TTL-based). |
 
 ---
 

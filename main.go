@@ -5,24 +5,31 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/miekg/dns"
 )
 
 type backendPool struct {
+	name         string
 	domainSuffix string
 	backends     []BackendConfig
 	ring         *hashRing
 }
 
 type server struct {
-	cfg          *Config
-	conn         net.PacketConn
-	dnsttPools   []backendPool
-	forwardAddr  *net.UDPAddr
+	cfg            *Config
+	conn           net.PacketConn
+	dnsttPools     []backendPool
+	forwardAddr    *net.UDPAddr
+	sessionTracker *sessionTracker
 }
 
 func newServer(cfg *Config) (*server, error) {
+	if strings.TrimSpace(cfg.Global.ListenAddress) == "" {
+		return nil, fmt.Errorf("global.listen_address is required and cannot be empty")
+	}
 	conn, err := net.ListenPacket("udp", cfg.Global.ListenAddress)
 	if err != nil {
 		return nil, err
@@ -31,10 +38,12 @@ func newServer(cfg *Config) (*server, error) {
 	var forwardAddr *net.UDPAddr
 	if cfg.Global.DefaultDNSBehavior.Mode == DefaultDNSModeForward {
 		if cfg.Global.DefaultDNSBehavior.ForwardResolver == "" {
+			conn.Close()
 			return nil, fmt.Errorf("default_dns_behavior.mode is 'forward' but forward_resolver is empty")
 		}
 		forwardAddr, err = net.ResolveUDPAddr("udp", cfg.Global.DefaultDNSBehavior.ForwardResolver)
 		if err != nil {
+			conn.Close()
 			return nil, err
 		}
 	}
@@ -46,6 +55,7 @@ func newServer(cfg *Config) (*server, error) {
 		}
 		ring := newHashRing(p.Backends, 0)
 		dnsttPools = append(dnsttPools, backendPool{
+			name:         p.Name,
 			domainSuffix: p.DomainSuffix,
 			backends:     p.Backends,
 			ring:         ring,
@@ -53,10 +63,11 @@ func newServer(cfg *Config) (*server, error) {
 	}
 
 	return &server{
-		cfg:         cfg,
-		conn:        conn,
-		dnsttPools:  dnsttPools,
-		forwardAddr: forwardAddr,
+		cfg:            cfg,
+		conn:           conn,
+		dnsttPools:     dnsttPools,
+		forwardAddr:    forwardAddr,
+		sessionTracker: newSessionTracker(10 * time.Minute),
 	}, nil
 }
 
@@ -68,6 +79,8 @@ func (s *server) serve() error {
 		if err != nil {
 			return err
 		}
+		frontendPacketsIn.Inc()
+		frontendBytesIn.Add(float64(n))
 		packet := make([]byte, n)
 		copy(packet, buf[:n])
 		go s.handlePacket(packet, addr)
@@ -77,8 +90,23 @@ func (s *server) serve() error {
 func (s *server) handlePacket(packet []byte, src net.Addr) {
 	var msg dns.Msg
 	if err := msg.Unpack(packet); err != nil {
+		parseErrorsTotal.WithLabelValues("dns_unpack").Inc()
+		dnsRequestsTotal.WithLabelValues("other").Inc()
 		s.forwardOrDrop(packet, src)
 		return
+	}
+
+	// Track unsupported QTYPEs under configured dnstt domains.
+	if len(msg.Question) == 1 {
+		q := msg.Question[0]
+		lowerName := strings.ToLower(strings.TrimSuffix(q.Name, "."))
+		for _, pool := range s.dnsttPools {
+			suffix := strings.ToLower(pool.domainSuffix)
+			if strings.HasSuffix(lowerName, "."+suffix) && q.Qtype != dns.TypeTXT {
+				unsupportedQueriesTotal.WithLabelValues(fmt.Sprintf("%d", q.Qtype)).Inc()
+				break
+			}
+		}
 	}
 
 	// dnstt handling
@@ -88,73 +116,105 @@ func (s *server) handlePacket(packet []byte, src net.Addr) {
 		}
 		sid, ok := extractDNSTTSessionID(&msg, pool.domainSuffix)
 		if !ok {
+			parseErrorsTotal.WithLabelValues("dnstt_session_id").Inc()
+			dnsRequestsTotal.WithLabelValues("other").Inc()
 			s.forwardOrDrop(packet, src)
 			return
 		}
 		backend := pool.ring.choose("dnstt", pool.domainSuffix, sid)
+		if s.sessionTracker != nil {
+			s.sessionTracker.observeSession("dnstt", pool.name, pool.domainSuffix, backend, sid)
+		}
+		dnsRequestsTotal.WithLabelValues("dnstt").Inc()
+		dnsRoutedRequestsTotal.WithLabelValues("dnstt", pool.name).Inc()
+		labels := labelsForBackend("dnstt", pool.name, pool.domainSuffix, backend)
+		backendRequestsTotal.With(labels).Inc()
 		logDebugf("dnstt session %x -> backend %s (%s)", sid, backend.ID, backend.Address)
-		s.forwardToBackend(packet, src, backend.Address)
+		s.forwardToBackend(packet, src, "dnstt", pool.name, pool.domainSuffix, backend)
 		return
 	}
 
+	dnsRequestsTotal.WithLabelValues("other").Inc()
 	s.forwardOrDrop(packet, src)
 }
 
 func (s *server) forwardOrDrop(packet []byte, src net.Addr) {
 	if s.forwardAddr == nil {
+		dnsDroppedRequestsTotal.WithLabelValues("no_forwarder").Inc()
 		return
 	}
 	// Simple stateless forward: send to resolver, copy response back.
 	resolverConn, err := net.DialUDP("udp", nil, s.forwardAddr)
 	if err != nil {
 		logErrorf("forward dial: %v", err)
+		dnsDroppedRequestsTotal.WithLabelValues("forward_dial_error").Inc()
 		return
 	}
 	defer resolverConn.Close()
 
+	dnsForwardedRequestsTotal.Inc()
+
 	if _, err := resolverConn.Write(packet); err != nil {
 		logErrorf("forward write: %v", err)
+		dnsDroppedRequestsTotal.WithLabelValues("forward_write_error").Inc()
 		return
 	}
-
+	resolverConn.SetReadDeadline(time.Now().Add(s.cfg.parsedReadTimeout))
 	resp := make([]byte, 4096)
 	n, _, err := resolverConn.ReadFrom(resp)
 	if err != nil {
 		logErrorf("forward read: %v", err)
+		dnsDroppedRequestsTotal.WithLabelValues("forward_read_error").Inc()
 		return
 	}
 	if _, err := s.conn.WriteTo(resp[:n], src); err != nil {
 		logErrorf("forward reply: %v", err)
+		dnsDroppedRequestsTotal.WithLabelValues("forward_reply_error").Inc()
+		return
 	}
+	frontendPacketsOut.Inc()
+	frontendBytesOut.Add(float64(n))
 }
 
-func (s *server) forwardToBackend(packet []byte, src net.Addr, backendAddr string) {
-	udpAddr, err := net.ResolveUDPAddr("udp", backendAddr)
+func (s *server) forwardToBackend(packet []byte, src net.Addr, protocol, pool, domain string, backend BackendConfig) {
+	udpAddr, err := net.ResolveUDPAddr("udp", backend.Address)
 	if err != nil {
 		logErrorf("resolve backend: %v", err)
+		backendErrorsTotal.With(labelsForBackendWithStage(protocol, pool, domain, backend, "resolve")).Inc()
 		return
 	}
 	conn, err := net.DialUDP("udp", nil, udpAddr)
 	if err != nil {
 		logErrorf("dial backend: %v", err)
+		backendErrorsTotal.With(labelsForBackendWithStage(protocol, pool, domain, backend, "dial")).Inc()
 		return
 	}
 	defer conn.Close()
 
 	if _, err := conn.Write(packet); err != nil {
 		logErrorf("write backend: %v", err)
+		backendErrorsTotal.With(labelsForBackendWithStage(protocol, pool, domain, backend, "write")).Inc()
 		return
 	}
-
+	labels := labelsForBackend(protocol, pool, domain, backend)
+	backendPacketsSent.With(labels).Inc()
+	backendBytesSent.With(labels).Add(float64(len(packet)))
+	conn.SetReadDeadline(time.Now().Add(s.cfg.parsedReadTimeout))
 	resp := make([]byte, 4096)
 	n, _, err := conn.ReadFrom(resp)
 	if err != nil {
 		logErrorf("read backend: %v", err)
+		backendErrorsTotal.With(labelsForBackendWithStage(protocol, pool, domain, backend, "read")).Inc()
 		return
 	}
+	backendPacketsReceived.With(labels).Inc()
+	backendBytesReceived.With(labels).Add(float64(n))
 	if _, err := s.conn.WriteTo(resp[:n], src); err != nil {
 		logErrorf("reply backend: %v", err)
+		return
 	}
+	frontendPacketsOut.Inc()
+	frontendBytesOut.Add(float64(n))
 }
 
 func main() {
@@ -170,6 +230,14 @@ func main() {
 
 	initLogger(cfg.Logging.Level)
 
+	if cfg.Global.MetricsListen != "" {
+		go func() {
+			if err := startMetricsServer(cfg.Global.MetricsListen); err != nil {
+				logErrorf("metrics server: %v", err)
+			}
+		}()
+	}
+
 	s, err := newServer(cfg)
 	if err != nil {
 		logErrorf("init server: %v", err)
@@ -179,7 +247,11 @@ func main() {
 	logInfof("listening on %s", cfg.Global.ListenAddress)
 	logInfof("configured %d dnstt pool(s)", len(s.dnsttPools))
 	for _, p := range s.dnsttPools {
-		logDebugf("dnstt pool %q suffix=%q backends=%d", p.domainSuffix, p.domainSuffix, len(p.backends))
+		logDebugf("dnstt pool %q suffix=%q backends=%d", p.name, p.domainSuffix, len(p.backends))
+	}
+
+	if s.sessionTracker != nil {
+		s.sessionTracker.startSessionJanitor()
 	}
 
 	if err := s.serve(); err != nil {
